@@ -1,6 +1,9 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk  # Pillow for image handling
+from PIL import Image, ImageTk, ExifTags  # Pillow for image handling
+import os
+import mimetypes
+from datetime import datetime
 
 # --- Configurable layout & style ---
 LEFT_COL_WIDTH = 250
@@ -87,6 +90,7 @@ canvas.bind("<Leave>", _unbind_mousewheel)
 
 # Keep references to avoid garbage collection
 loaded_images = []
+image_frames = []  # Keep track of frame widgets for removal
 
 # --- Upload button function ---
 def upload_image():
@@ -112,14 +116,54 @@ def upload_image():
                 padx=IMAGE_BORDER_WIDTH,
                 pady=IMAGE_BORDER_WIDTH
             )
-            border_frame.pack(pady=10)
+            border_frame.pack(pady=(10, 5))
+            image_frames.append(border_frame)
+
+            # Create a container for the image with relative positioning for the remove button
+            content_frame = tk.Frame(border_frame, bg="white")
+            content_frame.pack(expand=True, fill="both")
 
             # Inner label to display the image (centered)
-            img_label = tk.Label(border_frame, image=photo, bg="white")
-            img_label.pack()
+            img_label = tk.Label(content_frame, image=photo, bg="white")
+            img_label.pack(expand=True, fill="both")
+
+            # Add remove button with absolute positioning over the image
+            remove_btn = tk.Button(
+                content_frame,
+                text="×",  # Unicode × symbol
+                font=("Arial", 12, "bold"),
+                fg="red",
+                bg="white",
+                relief="solid",  # Add border
+                bd=1,  # Border width
+                width=2,
+                height=1,
+                cursor="hand2",  # Show hand cursor on hover
+                command=lambda f=border_frame: remove_image(f)
+            )
+            remove_btn.place(relx=1.0, rely=0.0, anchor="ne", x=-2, y=2)  # Position at top-right with small offset
+            # Bind click to show metadata for this image and highlight border
+            img_label.bind("<Button-1>", lambda e, p=file_path, b=border_frame: on_image_click(p, b))
 
         except Exception as e:
             messagebox.showerror("Error", f"Could not load image:\n{e}")
+
+def remove_image(frame):
+    # If this was the selected image, clear metadata
+    if selected_border.get('widget') == frame:
+        for var in meta_fields.values():
+            var.set('N/A')
+        selected_border['widget'] = None
+    
+    # Remove from our tracking lists
+    if frame in image_frames:
+        image_frames.remove(frame)
+    
+    # Destroy the frame widget (this removes it from display)
+    frame.destroy()
+    
+    # Update the canvas scroll region
+    canvas.configure(scrollregion=canvas.bbox("all"))
 
 # --- Navbar content ---
 upload_btn = tk.Button(
@@ -144,6 +188,150 @@ header_label = tk.Label(
 )
 header_label.pack(anchor="w", padx=20, pady=15)
 
-tk.Label(main_right, text="Right Content Area", bg="lightgreen", font=("Arial", 12, "bold")).pack(pady=20)
+# --- Metadata display on the right column ---
+info_frame = tk.Frame(main_right, bg="lightgreen")
+info_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+# Dictionary of fields to show and their StringVars for easy updates
+meta_fields = {
+    'CreateDate': tk.StringVar(value='N/A'),
+    'ModifyDate': tk.StringVar(value='N/A'),
+    'GPSLatitude': tk.StringVar(value='N/A'),
+    'GPSLongitude': tk.StringVar(value='N/A'),
+    'GPSAltitude': tk.StringVar(value='N/A'),
+    'ImageWidth': tk.StringVar(value='N/A'),
+    'ImageHeight': tk.StringVar(value='N/A'),
+    'FileName': tk.StringVar(value='N/A'),
+    'FileSize': tk.StringVar(value='N/A'),
+    'FileType': tk.StringVar(value='N/A'),
+    'FileExtension': tk.StringVar(value='N/A'),
+}
+
+for key, var in meta_fields.items():
+    row = tk.Frame(info_frame, bg="lightgreen")
+    row.pack(fill='x', pady=2)
+    tk.Label(row, text=f"{key}:", width=15, anchor='w', bg="lightgreen", font=("Arial", 10, "bold")).pack(side='left')
+    tk.Label(row, textvariable=var, anchor='w', bg="lightgreen", font=("Arial", 10)).pack(side='left')
+
+selected_border = {'widget': None}
+
+def _rational_to_float(rat):
+    # rat may be a tuple (num, den) or a rational-like object
+    try:
+        return float(rat[0]) / float(rat[1])
+    except Exception:
+        try:
+            return float(rat)
+        except Exception:
+            return 0.0
+
+def _dms_to_decimal(dms, ref):
+    # dms is a sequence of 3 tuples [(deg_num,deg_den), (min_num,min_den), (sec_num,sec_den)]
+    try:
+        deg = _rational_to_float(dms[0])
+        minute = _rational_to_float(dms[1])
+        sec = _rational_to_float(dms[2])
+        dec = deg + (minute / 60.0) + (sec / 3600.0)
+        if ref in ['S', 'W']:
+            dec = -dec
+        return round(dec, 6)
+    except Exception:
+        return 'N/A'
+
+def extract_exif(image):
+    exif_data = {}
+    try:
+        raw = image._getexif() or {}
+        for tag, value in raw.items():
+            decoded = ExifTags.TAGS.get(tag, tag)
+            exif_data[decoded] = value
+    except Exception:
+        pass
+    return exif_data
+
+def parse_gps(exif):
+    gps_lat = gps_lon = gps_alt = 'N/A'
+    gps_info = exif.get('GPSInfo') if exif else None
+    if gps_info:
+        # GPSInfo keys are numeric; map them
+        gps = {}
+        for t, val in gps_info.items():
+            sub_tag = ExifTags.GPSTAGS.get(t, t)
+            gps[sub_tag] = val
+
+        lat = gps.get('GPSLatitude')
+        lat_ref = gps.get('GPSLatitudeRef')
+        lon = gps.get('GPSLongitude')
+        lon_ref = gps.get('GPSLongitudeRef')
+        alt = gps.get('GPSAltitude')
+
+        if lat and lat_ref:
+            gps_lat = _dms_to_decimal(lat, lat_ref)
+        if lon and lon_ref:
+            gps_lon = _dms_to_decimal(lon, lon_ref)
+        if alt:
+            try:
+                gps_alt = round(_rational_to_float(alt), 2)
+            except Exception:
+                gps_alt = 'N/A'
+
+    return gps_lat, gps_lon, gps_alt
+
+def show_metadata(file_path):
+    # Filesystem info
+    try:
+        stat = os.stat(file_path)
+        create_ts = datetime.fromtimestamp(stat.st_ctime)
+        modify_ts = datetime.fromtimestamp(stat.st_mtime)
+        meta_fields['CreateDate'].set(create_ts.strftime('%Y-%m-%d %H:%M:%S'))
+        meta_fields['ModifyDate'].set(modify_ts.strftime('%Y-%m-%d %H:%M:%S'))
+        meta_fields['FileSize'].set(f"{stat.st_size} bytes")
+    except Exception:
+        meta_fields['CreateDate'].set('N/A')
+        meta_fields['ModifyDate'].set('N/A')
+        meta_fields['FileSize'].set('N/A')
+
+    # File name and extension and mimetype
+    try:
+        base = os.path.basename(file_path)
+        meta_fields['FileName'].set(base)
+        ext = os.path.splitext(base)[1]
+        meta_fields['FileExtension'].set(ext)
+        mtype, _ = mimetypes.guess_type(file_path)
+        meta_fields['FileType'].set(mtype or 'N/A')
+    except Exception:
+        meta_fields['FileName'].set('N/A')
+        meta_fields['FileExtension'].set('N/A')
+        meta_fields['FileType'].set('N/A')
+
+    # Image-specific info and EXIF
+    try:
+        with Image.open(file_path) as im:
+            w, h = im.size
+            meta_fields['ImageWidth'].set(str(w))
+            meta_fields['ImageHeight'].set(str(h))
+            exif = extract_exif(im)
+            lat, lon, alt = parse_gps(exif)
+            meta_fields['GPSLatitude'].set(lat)
+            meta_fields['GPSLongitude'].set(lon)
+            meta_fields['GPSAltitude'].set(alt)
+    except Exception:
+        meta_fields['ImageWidth'].set('N/A')
+        meta_fields['ImageHeight'].set('N/A')
+        meta_fields['GPSLatitude'].set('N/A')
+        meta_fields['GPSLongitude'].set('N/A')
+        meta_fields['GPSAltitude'].set('N/A')
+
+def on_image_click(file_path, border_widget):
+    # highlight selection
+    prev = selected_border.get('widget')
+    if prev and prev.winfo_exists():
+        prev.config(bg=IMAGE_BORDER_COLOR)
+    try:
+        border_widget.config(bg='#FF8C00')
+        selected_border['widget'] = border_widget
+    except Exception:
+        pass
+    show_metadata(file_path)
 
 root.mainloop()
